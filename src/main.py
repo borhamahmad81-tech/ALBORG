@@ -159,138 +159,176 @@ def main():
         print("Nothing left to do - every patient is already in the output file.")
         sys.exit(0)
 
-    pw, context = launch_browser(headless=args.headless)
+    max_attempts = 8
+    attempt = 0
+    remaining = list(patients)
 
-    # If the profile restored leftover tabs from a previous crash, reuse the
-    # first one and close the rest, so there's always exactly ONE tab to
-    # work with - never two.
-    if context.pages:
-        page = context.pages[0]
-        for extra in context.pages[1:]:
-            try:
-                extra.close()
-            except Exception:
-                pass
-    else:
-        page = context.new_page()
+    while remaining and attempt < max_attempts:
+        attempt += 1
+        if attempt > 1:
+            print(f"\n>> Restarting the browser automatically (attempt {attempt}/{max_attempts}) "
+                  f"- {len(remaining)} patient(s) left...")
+            time.sleep(3)
 
-    try:
-        ensure_logged_in(context, page)
+        pw = context = page = None
+        try:
+            pw, context = launch_browser(headless=args.headless)
 
-        for i, patient in enumerate(patients, start=1):
-            label = f"[{i}/{len(patients)}] {patient.patient_id} ({patient.name or 'no name'})"
-            print(label)
-            close_extra_tabs(context, page)
-            try:
-                search_patient(page, patient.patient_id)
-                rows = get_result_rows(page)
-                print(f"    found {len(rows)} result rows; "
-                      f"departments: {sorted({r.test_department for r in rows})}")
+            # If the profile restored leftover tabs from a previous crash,
+            # reuse the first one and close the rest - always exactly one tab.
+            if context.pages:
+                page = context.pages[0]
+                for extra in context.pages[1:]:
+                    try:
+                        extra.close()
+                    except Exception:
+                        pass
+            else:
+                page = context.new_page()
 
-                if not rows:
+            ensure_logged_in(context, page)
+
+            for i, patient in enumerate(remaining, start=1):
+                label = f"[{i}/{len(remaining)}] {patient.patient_id} ({patient.name or 'no name'})"
+                print(label)
+                close_extra_tabs(context, page)
+                try:
+                    search_patient(page, patient.patient_id)
+                    rows = get_result_rows(page)
+                    print(f"    found {len(rows)} result rows; "
+                          f"departments: {sorted({r.test_department for r in rows})}")
+
+                    if not rows:
+                        errors.append({
+                            "patient_id": patient.patient_id, "patient_name": patient.name,
+                            "stage": "search", "details": "No results returned for this patient ID",
+                        })
+                        if args.debug:
+                            dump_debug(page, f"no_results_{patient.patient_id}")
+                        continue
+
+                    target = pick_target_row(rows, args.month, allow_older=args.allow_older)
+                    if target is None:
+                        errors.append({
+                            "patient_id": patient.patient_id, "patient_name": patient.name,
+                            "stage": "select_row",
+                            "details": f"No 'All Services' report found for {args.month} "
+                                       "(no fallback to older months - pass --allow-older to permit that)",
+                        })
+                        if args.debug:
+                            dump_debug(page, f"no_all_services_{patient.patient_id}")
+                        continue
+
+                    print(f"    picked All Services row dated {target.visit_date_text}")
+                    pdf_bytes = fetch_report_pdf(context, page, target)
+                    print(f"    downloaded {len(pdf_bytes)} bytes")
+
+                    if not pdf_bytes.startswith(b"%PDF"):
+                        saved_note = ""
+                        if args.debug:
+                            Path("debug").mkdir(exist_ok=True)
+                            bad_path = Path("debug") / f"not_a_pdf_{patient.patient_id}.bin"
+                            bad_path.write_bytes(pdf_bytes)
+                            saved_note = f" Saved a copy to {bad_path} - send this file over."
+                        raise RuntimeError(
+                            f"Downloaded report was not a valid PDF ({len(pdf_bytes)} bytes)."
+                            + saved_note
+                            + (" Re-run with --debug to save a copy next time." if not args.debug else "")
+                        )
+
+                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                        tmp.write(pdf_bytes)
+                        tmp_path = tmp.name
+
+                    parsed = parse_lab_pdf(tmp_path)
+                    Path(tmp_path).unlink(missing_ok=True)
+                    print(f"    PDF patient no: '{parsed.patient_no}'; "
+                          f"parsed {len(parsed.results)} test rows")
+
+                    searched_id = str(patient.patient_id).strip()
+                    pdf_id = str(parsed.patient_no).strip()
+                    if pdf_id and pdf_id != searched_id:
+                        errors.append({
+                            "patient_id": patient.patient_id, "patient_name": patient.name,
+                            "stage": "id_mismatch",
+                            "details": f"Searched for {searched_id} but the downloaded "
+                                       f"PDF's own 'Patient No.' field says {pdf_id}. "
+                                       "Results NOT saved - re-check this patient manually.",
+                        })
+                        if args.debug:
+                            Path("debug").mkdir(exist_ok=True)
+                            (Path("debug") / f"id_mismatch_{patient.patient_id}.pdf").write_bytes(pdf_bytes)
+                        print(f"    !! ID MISMATCH: searched {searched_id}, "
+                              f"PDF says {pdf_id} - skipped")
+                        continue
+
+                    for r in parsed.results:
+                        all_results.append({
+                            "patient_id": patient.patient_id, "patient_name": patient.name,
+                            "accession_no": r.accession_no, "section": r.section,
+                            "category": r.category, "test": r.test, "result": r.result,
+                            "flag": r.flag, "unit": r.unit, "ref_range": r.ref_range,
+                            "registered_on": r.registered_on, "reported_on": r.reported_on,
+                            "contract": r.contract,
+                        })
+
+                    for line in parsed.unparsed_lines:
+                        unparsed.append({
+                            "patient_id": patient.patient_id, "patient_name": patient.name,
+                            "line": line,
+                        })
+
+                    print(f"    -> {len(parsed.results)} test results ({target.visit_date_text})")
+
+                except Exception as exc:  # one bad patient shouldn't kill the batch
                     errors.append({
                         "patient_id": patient.patient_id, "patient_name": patient.name,
-                        "stage": "search", "details": "No results returned for this patient ID",
+                        "stage": "fetch_or_parse", "details": str(exc),
                     })
                     if args.debug:
-                        dump_debug(page, f"no_results_{patient.patient_id}")
-                    continue
+                        try:
+                            dump_debug(page, f"error_{patient.patient_id}")
+                        except Exception:
+                            pass
+                    print(f"    !! ERROR: {exc}")
 
-                target = pick_target_row(rows, args.month, allow_older=args.allow_older)
-                if target is None:
-                    errors.append({
-                        "patient_id": patient.patient_id, "patient_name": patient.name,
-                        "stage": "select_row",
-                        "details": f"No 'All Services' report found for {args.month} "
-                                   "(no fallback to older months - pass --allow-older to permit that)",
-                    })
-                    if args.debug:
-                        dump_debug(page, f"no_all_services_{patient.patient_id}")
-                    continue
+                try:
+                    write_master_workbook(args.output, all_results, errors, unparsed)
+                except Exception as save_exc:
+                    print(f"    (warning: could not checkpoint-save this round: {save_exc})")
 
-                print(f"    picked All Services row dated {target.visit_date_text}")
-                pdf_bytes = fetch_report_pdf(context, page, target)
-                print(f"    downloaded {len(pdf_bytes)} bytes")
+                time.sleep(2)  # be polite to the portal between patients
 
-                if not pdf_bytes.startswith(b"%PDF"):
-                    saved_note = ""
-                    if args.debug:
-                        Path("debug").mkdir(exist_ok=True)
-                        bad_path = Path("debug") / f"not_a_pdf_{patient.patient_id}.bin"
-                        bad_path.write_bytes(pdf_bytes)
-                        saved_note = f" Saved a copy to {bad_path} - send this file over."
-                    raise RuntimeError(
-                        f"Downloaded report was not a valid PDF ({len(pdf_bytes)} bytes)."
-                        + saved_note
-                        + (" Re-run with --debug to save a copy next time." if not args.debug else "")
-                    )
+        except Exception as exc:
+            # The browser/driver itself crashed (not a single-patient error) -
+            # loop back around and relaunch automatically instead of stopping.
+            print(f"\n!! Browser crashed: {exc}")
 
-                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                    tmp.write(pdf_bytes)
-                    tmp_path = tmp.name
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            if pw is not None:
+                try:
+                    pw.stop()
+                except Exception:
+                    pass
 
-                parsed = parse_lab_pdf(tmp_path)
-                Path(tmp_path).unlink(missing_ok=True)
-                print(f"    PDF patient no: '{parsed.patient_no}'; "
-                      f"parsed {len(parsed.results)} test rows")
-
-                searched_id = str(patient.patient_id).strip()
-                pdf_id = str(parsed.patient_no).strip()
-                if pdf_id and pdf_id != searched_id:
-                    errors.append({
-                        "patient_id": patient.patient_id, "patient_name": patient.name,
-                        "stage": "id_mismatch",
-                        "details": f"Searched for {searched_id} but the downloaded "
-                                   f"PDF's own 'Patient No.' field says {pdf_id}. "
-                                   "Results NOT saved - re-check this patient manually.",
-                    })
-                    if args.debug:
-                        Path("debug").mkdir(exist_ok=True)
-                        (Path("debug") / f"id_mismatch_{patient.patient_id}.pdf").write_bytes(pdf_bytes)
-                    print(f"    !! ID MISMATCH: searched {searched_id}, "
-                          f"PDF says {pdf_id} - skipped")
-                    continue
-
-                for r in parsed.results:
-                    all_results.append({
-                        "patient_id": patient.patient_id, "patient_name": patient.name,
-                        "accession_no": r.accession_no, "section": r.section,
-                        "category": r.category, "test": r.test, "result": r.result,
-                        "flag": r.flag, "unit": r.unit, "ref_range": r.ref_range,
-                        "registered_on": r.registered_on, "reported_on": r.reported_on,
-                        "contract": r.contract,
-                    })
-
-                for line in parsed.unparsed_lines:
-                    unparsed.append({
-                        "patient_id": patient.patient_id, "patient_name": patient.name,
-                        "line": line,
-                    })
-
-                print(f"    -> {len(parsed.results)} test results ({target.visit_date_text})")
-
-            except Exception as exc:  # keep going - one bad patient shouldn't kill the batch
-                errors.append({
-                    "patient_id": patient.patient_id, "patient_name": patient.name,
-                    "stage": "fetch_or_parse", "details": str(exc),
-                })
-                if args.debug:
-                    dump_debug(page, f"error_{patient.patient_id}")
-                print(f"    !! ERROR: {exc}")
-
-            try:
-                write_master_workbook(args.output, all_results, errors, unparsed)
-            except Exception as save_exc:
-                print(f"    (warning: could not checkpoint-save this round: {save_exc})")
-
-            time.sleep(2)  # be polite to the portal between patients
-
-    finally:
-        context.close()
-        pw.stop()
+        # Recompute what's actually left: anyone who succeeded or already got
+        # a logged error (e.g. "no data this month") is done; only patients
+        # that never got a chance to finish (crashed mid-way) get retried.
+        done_ids = get_completed_patient_ids(all_results)
+        errored_ids = {str(e["patient_id"]) for e in errors}
+        remaining = [p for p in patients
+                     if p.patient_id not in done_ids and p.patient_id not in errored_ids]
 
     write_master_workbook(args.output, all_results, errors, unparsed)
     print(f"\nDone. {len(all_results)} test rows, {len(errors)} errors -> {args.output}")
+    if remaining:
+        print(f"{len(remaining)} patient(s) still incomplete after {max_attempts} attempts - "
+              "run again later, or check run_log.txt.")
     if errors:
         print("See the 'Errors' sheet in the output file for details.")
 
