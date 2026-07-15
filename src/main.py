@@ -76,6 +76,8 @@ def parse_args():
                         "after you've logged in at least once).")
     p.add_argument("--debug", action="store_true",
                    help="Save a screenshot + HTML dump of the search page on failure.")
+    p.add_argument("--browser", default="edge", choices=["edge", "chrome"],
+                   help="Which browser to drive: edge (default) or chrome.")
     p.add_argument("--restart", action="store_true",
                    help="Ignore any existing output file and start over from patient 1. "
                         "By default, if --output already exists, already-completed "
@@ -123,7 +125,11 @@ def _resolve_input_path(input_arg: str) -> str:
 def main():
     args = parse_args()
 
-    sys.stdout = _Tee("run_log.txt")
+    # When launched from the GUI, stdout is already redirected to the window,
+    # so don't wrap it again (that would duplicate/interfere). Only tee to a
+    # log file when running as the plain command-line/exe entry point.
+    if not getattr(sys.stdout, "_is_gui_writer", False):
+        sys.stdout = _Tee("run_log.txt")
     print(f"=== Run started {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
 
     if args.month is None:
@@ -172,7 +178,8 @@ def main():
 
         pw = context = page = None
         try:
-            pw, context = launch_browser(headless=args.headless)
+            pw, context = launch_browser(headless=args.headless,
+                                         browser_choice=args.browser)
 
             # If the profile restored leftover tabs from a previous crash,
             # reuse the first one and close the rest - always exactly one tab.

@@ -44,13 +44,16 @@ class ResultRow:
     report_url: str = ""  # direct href of the Report link, if capturable
 
 
-def launch_browser(headless: bool = False, profile_dir: Path = DEFAULT_PROFILE_DIR):
-    """Launch (or reuse) a persistent Edge profile. Returns (playwright, context).
+def launch_browser(headless: bool = False, profile_dir: Path = DEFAULT_PROFILE_DIR,
+                   browser_choice: str = "edge"):
+    """Launch (or reuse) a persistent browser profile. Returns (playwright, context).
 
-    Uses the copy of Microsoft Edge already installed on the machine
-    (channel='msedge'), so nothing extra needs downloading for the browser
-    itself. Only Playwright's small internal driver is needed, which the
-    build bundles; if it's somehow missing we surface a clear message."""
+    browser_choice: 'edge' (default) uses installed Microsoft Edge, 'chrome'
+    uses installed Google Chrome. Each browser gets its own profile folder so
+    logins don't clash. Falls back to bundled Chromium if the chosen browser
+    can't launch."""
+    # Separate profile per browser so switching doesn't mix up sessions.
+    profile_dir = profile_dir.parent / f"profile_{browser_choice}"
     profile_dir.mkdir(parents=True, exist_ok=True)
     _clear_stale_profile_locks(profile_dir)
 
@@ -68,24 +71,27 @@ def launch_browser(headless: bool = False, profile_dir: Path = DEFAULT_PROFILE_D
         user_data_dir=str(profile_dir),
         headless=headless,
         viewport={"width": 1400, "height": 900},
+        accept_downloads=True,
         # Suppress the "file downloaded" notification bubble that pops up in
         # the corner after each report download - possible source of focus
         # interference between patients.
-        args=["--disable-features=DownloadBubble,DownloadBubbleV2"],
+        args=["--disable-features=DownloadBubble,DownloadBubbleV2",
+              "--disable-popup-blocking"],
     )
 
-    # Prefer the user's installed Microsoft Edge. If that can't launch for any
-    # reason, fall back to the Chromium engine bundled inside the .exe so the
-    # program still works out of the box.
+    channel = "chrome" if browser_choice == "chrome" else "msedge"
+
+    # Try the chosen browser; if it can't launch, fall back to bundled Chromium
+    # so the program still works out of the box.
     try:
-        context = pw.chromium.launch_persistent_context(channel="msedge", **common_args)
+        context = pw.chromium.launch_persistent_context(channel=channel, **common_args)
     except Exception:
         try:
             context = pw.chromium.launch_persistent_context(**common_args)
         except Exception as exc:
             pw.stop()
             raise RuntimeError(
-                "Could not launch a browser (tried Edge, then bundled Chromium). "
+                f"Could not launch {browser_choice} (also tried bundled Chromium). "
                 "Original error: " + str(exc)
             )
 
