@@ -281,6 +281,19 @@ def main():
                     print(f"    -> {len(parsed.results)} test results ({target.visit_date_text})")
 
                 except Exception as exc:  # one bad patient shouldn't kill the batch
+                    msg = str(exc).lower()
+                    connection_dead = any(s in msg for s in (
+                        "connection closed", "target page, context or browser has been closed",
+                        "target closed", "browser has been closed", "websocket",
+                        "page.goto", "has been closed",
+                    ))
+                    if connection_dead:
+                        # The browser itself died - don't mark this patient as a
+                        # permanent error. Re-raise so the outer loop relaunches
+                        # the browser and retries this patient.
+                        print(f"    !! Browser connection lost on this patient - "
+                              f"will relaunch and retry.")
+                        raise
                     errors.append({
                         "patient_id": patient.patient_id, "patient_name": patient.name,
                         "stage": "fetch_or_parse", "details": str(exc),

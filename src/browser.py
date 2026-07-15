@@ -41,6 +41,7 @@ class ResultRow:
     accession_no: str
     test_department: str
     row_index: int  # index among matching rows, used to re-locate the row
+    report_url: str = ""  # direct href of the Report link, if capturable
 
 
 def launch_browser(headless: bool = False, profile_dir: Path = DEFAULT_PROFILE_DIR):
@@ -261,12 +262,26 @@ def get_result_rows(page: Page) -> list[ResultRow]:
         if department is None:
             continue
 
+        # Try to grab the Report link's href directly, so we can fetch the
+        # PDF without opening a viewer tab (that tab-open sequence was
+        # crashing the browser connection between patients).
+        report_url = ""
+        try:
+            link = row.locator("a").filter(has_text=re.compile("Report", re.I))
+            if link.count() > 0:
+                href = link.first.get_attribute("href", timeout=2000)
+                if href:
+                    report_url = href
+        except Exception:
+            pass
+
         parsed.append(ResultRow(
             visit_date_text=visit_date_text or "",
             visit_date=visit_date,
             accession_no=accession_no or "",
             test_department=department,
             row_index=i,
+            report_url=report_url,
         ))
 
     return parsed
@@ -324,11 +339,39 @@ def pick_target_row(rows: list[ResultRow], month_filter: str | None,
 
 
 def fetch_report_pdf(context: BrowserContext, page: Page, row: ResultRow) -> bytes:
-    """Click the Report link for the given row, wait for the embedded PDF
-    viewer to load (this can take a few seconds for a real report), then
-    click the viewer's built-in 'PDF' button and capture the resulting
-    browser download - this is the same mechanism a human clicking it would
-    trigger, so it's the most reliable way to get the actual file."""
+    """Get the report PDF.
+
+    PRIMARY method (no new tab): if we captured the Report link's URL from
+    the results table, fetch it directly using the logged-in session. This
+    avoids opening Edge's PDF viewer tab entirely - that tab open/close
+    sequence was crashing the browser connection between patients.
+
+    FALLBACK method: if we don't have a URL or the direct fetch doesn't yield
+    a PDF, fall back to the old approach of clicking Report and reading the
+    viewer tab."""
+    referer = page.url
+
+    # --- Primary: direct fetch, no tab ---
+    if row.report_url:
+        full_url = row.report_url
+        if full_url.startswith("/"):
+            from urllib.parse import urljoin
+            full_url = urljoin(SITE_URL, full_url)
+        try:
+            body = _direct_fetch(context, full_url, referer)
+            if body.startswith(b"%PDF"):
+                return body
+            # Might be an HTML wrapper pointing at the real PDF.
+            html_text = body.decode("utf-8", errors="ignore")
+            nested = _find_nested_report_url(html_text, full_url)
+            if nested:
+                body2 = _direct_fetch(context, nested, referer)
+                if body2.startswith(b"%PDF"):
+                    return body2
+        except Exception:
+            pass  # fall through to tab-based method
+
+    # --- Fallback: click Report, read the viewer tab ---
     rows_locator = page.get_by_role("row")
     target_row = rows_locator.nth(row.row_index)
     report_link = target_row.get_by_text("Report", exact=True)
@@ -342,30 +385,22 @@ def fetch_report_pdf(context: BrowserContext, page: Page, row: ResultRow) -> byt
             viewer_page.wait_for_load_state("load", timeout=30000)
         except PWTimeout:
             pass
-        # Give the embedded viewer time to actually render the report - real
-        # reports can take a few seconds, per live testing.
         viewer_page.wait_for_timeout(4000)
 
-        pdf_bytes = _download_via_pdf_button(viewer_page)
-
-        if pdf_bytes is None:
-            # Fallback: fetch the resolved report URL directly with the same
-            # session cookies, in case the PDF button isn't found this time.
-            report_url = viewer_page.url
-            referer = page.url
-            pdf_bytes = _direct_fetch(context, report_url, referer)
-            if not pdf_bytes.startswith(b"%PDF"):
-                html_text = pdf_bytes.decode("utf-8", errors="ignore")
-                nested_url = _find_nested_report_url(html_text, report_url)
-                if nested_url:
-                    pdf_bytes = _direct_fetch(context, nested_url, referer)
+        report_url = viewer_page.url
+        pdf_bytes = _direct_fetch(context, report_url, referer)
+        if not pdf_bytes.startswith(b"%PDF"):
+            html_text = pdf_bytes.decode("utf-8", errors="ignore")
+            nested_url = _find_nested_report_url(html_text, report_url)
+            if nested_url:
+                pdf_bytes = _direct_fetch(context, nested_url, referer)
+            else:
+                maybe = _download_via_pdf_button(viewer_page)
+                if maybe is not None:
+                    pdf_bytes = maybe
 
         return pdf_bytes
     finally:
-        # No matter what happened above (success, error, or a mid-step
-        # crash), always close this tab - leftover tabs from failed patients
-        # were piling up and could crash the whole run if one got closed
-        # manually while still in use.
         try:
             if not viewer_page.is_closed():
                 viewer_page.close()
