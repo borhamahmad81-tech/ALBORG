@@ -71,17 +71,13 @@ def read_patient_list(path: str, id_column: str = "Patient No",
 
 
 RESULT_HEADERS = [
-    "Patient ID", "Patient Name", "Accession No", "Section", "Category",
-    "Test", "Result", "Flag", "Unit", "Ref Range",
-    "Registered On", "Reported On", "Contract",
+    "Patient ID", "Patient Name", "Test", "Result", "Reported On",
 ]
 
 ERROR_HEADERS = ["Patient ID", "Patient Name", "Stage", "Details"]
 
 
-RESULT_KEYS = ["patient_id", "patient_name", "accession_no", "section", "category",
-               "test", "result", "flag", "unit", "ref_range",
-               "registered_on", "reported_on", "contract"]
+RESULT_KEYS = ["patient_id", "patient_name", "test", "result", "reported_on"]
 ERROR_KEYS = ["patient_id", "patient_name", "stage", "details"]
 UNPARSED_KEYS = ["patient_id", "patient_name", "line"]
 
@@ -134,15 +130,11 @@ def write_master_workbook(output_path: str, all_results: list[dict],
     _write_sheet(ws, RESULT_HEADERS, [
         [
             r.get("patient_id", ""), r.get("patient_name", ""),
-            r.get("accession_no", ""), r.get("section", ""),
-            r.get("category", ""), r.get("test", ""), r.get("result", ""),
-            r.get("flag", ""), r.get("unit", ""), r.get("ref_range", ""),
-            r.get("registered_on", ""), r.get("reported_on", ""),
-            r.get("contract", ""),
+            r.get("test", ""), _result_with_flag(r),
+            r.get("reported_on", ""),
         ]
         for r in all_results
     ])
-    _highlight_flags(ws)
 
     ws_err = wb.create_sheet("Errors")
     _write_sheet(ws_err, ERROR_HEADERS, [
@@ -180,14 +172,10 @@ def _write_sheet(ws, headers: list[str], rows: list[list]) -> None:
     ws.freeze_panes = "A2"
 
 
-def _highlight_flags(ws) -> None:
-    """Color H (high) results red and L (low) results blue for quick scanning."""
-    flag_col = RESULT_HEADERS.index("Flag") + 1
-    result_col = RESULT_HEADERS.index("Result") + 1
-    for row in ws.iter_rows(min_row=2, min_col=flag_col, max_col=flag_col):
-        cell = row[0]
-        result_cell = ws.cell(row=cell.row, column=result_col)
-        if cell.value == "H":
-            result_cell.font = Font(color="C00000", bold=True)
-        elif cell.value == "L":
-            result_cell.font = Font(color="0070C0", bold=True)
+def _result_with_flag(r: dict) -> str:
+    """Combine the numeric result with its H/L flag so that high/low info
+    isn't lost now that the separate Flag column has been removed.
+    e.g. result '10.6' + flag 'L' -> '10.6 L'."""
+    result = str(r.get("result", "") or "")
+    flag = str(r.get("flag", "") or "").strip()
+    return f"{result} {flag}".strip() if flag else result

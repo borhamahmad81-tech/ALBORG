@@ -22,12 +22,36 @@ import argparse
 import sys
 import tempfile
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+
+
+class _Tee:
+    """Write all console output to a log file as well as the screen, so the
+    full run can be reviewed even after the window closes."""
+    def __init__(self, log_path):
+        self._log = open(log_path, "w", encoding="utf-8")
+        self._stdout = sys.stdout
+
+    def write(self, text):
+        self._stdout.write(text)
+        try:
+            self._log.write(text)
+            self._log.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        self._stdout.flush()
+        try:
+            self._log.flush()
+        except Exception:
+            pass
 
 from browser import (
     launch_browser, ensure_logged_in, search_patient, get_result_rows,
-    pick_target_row, fetch_report_pdf, dump_debug, DEFAULT_PROFILE_DIR,
+    pick_target_row, fetch_report_pdf, dump_debug, close_extra_tabs,
+    DEFAULT_PROFILE_DIR,
 )
 from excel_io import (
     read_patient_list, write_master_workbook,
@@ -99,6 +123,9 @@ def _resolve_input_path(input_arg: str) -> str:
 def main():
     args = parse_args()
 
+    sys.stdout = _Tee("run_log.txt")
+    print(f"=== Run started {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
+
     if args.month is None:
         args.month = date.today().strftime("%Y-%m")
     print(f"Restricting to month: {args.month}"
@@ -133,7 +160,19 @@ def main():
         sys.exit(0)
 
     pw, context = launch_browser(headless=args.headless)
-    page = context.new_page()
+
+    # If the profile restored leftover tabs from a previous crash, reuse the
+    # first one and close the rest, so there's always exactly ONE tab to
+    # work with - never two.
+    if context.pages:
+        page = context.pages[0]
+        for extra in context.pages[1:]:
+            try:
+                extra.close()
+            except Exception:
+                pass
+    else:
+        page = context.new_page()
 
     try:
         ensure_logged_in(context, page)
@@ -141,9 +180,12 @@ def main():
         for i, patient in enumerate(patients, start=1):
             label = f"[{i}/{len(patients)}] {patient.patient_id} ({patient.name or 'no name'})"
             print(label)
+            close_extra_tabs(context, page)
             try:
                 search_patient(page, patient.patient_id)
                 rows = get_result_rows(page)
+                print(f"    found {len(rows)} result rows; "
+                      f"departments: {sorted({r.test_department for r in rows})}")
 
                 if not rows:
                     errors.append({
@@ -166,7 +208,9 @@ def main():
                         dump_debug(page, f"no_all_services_{patient.patient_id}")
                     continue
 
+                print(f"    picked All Services row dated {target.visit_date_text}")
                 pdf_bytes = fetch_report_pdf(context, page, target)
+                print(f"    downloaded {len(pdf_bytes)} bytes")
 
                 if not pdf_bytes.startswith(b"%PDF"):
                     saved_note = ""
@@ -187,21 +231,24 @@ def main():
 
                 parsed = parse_lab_pdf(tmp_path)
                 Path(tmp_path).unlink(missing_ok=True)
+                print(f"    PDF patient no: '{parsed.patient_no}'; "
+                      f"parsed {len(parsed.results)} test rows")
 
-                if parsed.patient_no and parsed.patient_no != patient.patient_id:
+                searched_id = str(patient.patient_id).strip()
+                pdf_id = str(parsed.patient_no).strip()
+                if pdf_id and pdf_id != searched_id:
                     errors.append({
                         "patient_id": patient.patient_id, "patient_name": patient.name,
                         "stage": "id_mismatch",
-                        "details": f"Searched for {patient.patient_id} but the downloaded "
-                                   f"PDF's own 'Patient No.' field says {parsed.patient_no}. "
+                        "details": f"Searched for {searched_id} but the downloaded "
+                                   f"PDF's own 'Patient No.' field says {pdf_id}. "
                                    "Results NOT saved - re-check this patient manually.",
                     })
                     if args.debug:
                         Path("debug").mkdir(exist_ok=True)
-                        Path("debug") / f"id_mismatch_{patient.patient_id}.pdf"
                         (Path("debug") / f"id_mismatch_{patient.patient_id}.pdf").write_bytes(pdf_bytes)
-                    print(f"    !! ID MISMATCH: searched {patient.patient_id}, "
-                          f"PDF says {parsed.patient_no} - skipped")
+                    print(f"    !! ID MISMATCH: searched {searched_id}, "
+                          f"PDF says {pdf_id} - skipped")
                     continue
 
                 for r in parsed.results:
