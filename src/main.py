@@ -52,6 +52,43 @@ def parse_args():
     return p.parse_args()
 
 
+def _resolve_input_path(input_arg: str) -> str:
+    """If the given path exists, use it as-is. Otherwise try to find it -
+    Windows hides file extensions by default, so a file you renamed to
+    'patients.xlsx' may actually be saved as 'patients.xlsx.xlsx' without
+    looking like it. If we can't find a sensible match, print exactly what
+    IS in the folder so it's obvious what to fix."""
+    here = Path(".")
+
+    if Path(input_arg).is_file():
+        return input_arg
+
+    doubled = input_arg + Path(input_arg).suffix  # patients.xlsx -> patients.xlsx.xlsx
+    if Path(doubled).is_file():
+        print(f"Note: '{input_arg}' wasn't found, but '{doubled}' was - using that. "
+              f"(Windows likely hid the real file extension when you renamed it.)")
+        return doubled
+
+    candidates = [
+        f for f in here.glob("*.xlsx")
+        if f.name.lower() not in ("patients_template.xlsx",)
+        and "master_labs" not in f.name.lower()
+    ]
+    if len(candidates) == 1:
+        print(f"Note: '{input_arg}' wasn't found, but '{candidates[0]}' was the only "
+              f"other Excel file here - using that.")
+        return str(candidates[0])
+
+    all_files = [f.name for f in here.iterdir() if f.is_file()]
+    print(f"\nCouldn't find the input file '{input_arg}' in this folder.")
+    print("Files actually in this folder:")
+    for f in all_files:
+        print(f"  - {f}")
+    print("\nMake sure your patient list is an .xlsx file in this same folder, "
+          "and that run.bat / the --input value matches its exact name.")
+    sys.exit(1)
+
+
 def main():
     args = parse_args()
 
@@ -61,7 +98,8 @@ def main():
           + (" (falling back to older months if needed)" if args.allow_older else
              " (strict - patients with nothing this month will be listed under Errors)"))
 
-    patients = read_patient_list(args.input)
+    input_path = _resolve_input_path(args.input)
+    patients = read_patient_list(input_path)
     if not patients:
         print("No patients found in the input file. Check the column headers.")
         sys.exit(1)
