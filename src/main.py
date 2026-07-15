@@ -231,16 +231,15 @@ def main():
                     print(f"    downloaded {len(pdf_bytes)} bytes")
 
                     if not pdf_bytes.startswith(b"%PDF"):
-                        saved_note = ""
-                        if args.debug:
-                            Path("debug").mkdir(exist_ok=True)
-                            bad_path = Path("debug") / f"not_a_pdf_{patient.patient_id}.bin"
+                        Path("debug").mkdir(exist_ok=True)
+                        bad_path = Path("debug") / f"not_a_pdf_{patient.patient_id}.html"
+                        try:
                             bad_path.write_bytes(pdf_bytes)
-                            saved_note = f" Saved a copy to {bad_path} - send this file over."
+                        except Exception:
+                            pass
                         raise RuntimeError(
-                            f"Downloaded report was not a valid PDF ({len(pdf_bytes)} bytes)."
-                            + saved_note
-                            + (" Re-run with --debug to save a copy next time." if not args.debug else "")
+                            f"Downloaded report was not a valid PDF ({len(pdf_bytes)} bytes). "
+                            f"Saved the content to {bad_path} - send that file over."
                         )
 
                     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
