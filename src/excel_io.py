@@ -9,6 +9,7 @@ Errors sheet listing any patient/report that failed to fetch or parse.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -76,6 +77,47 @@ RESULT_HEADERS = [
 ]
 
 ERROR_HEADERS = ["Patient ID", "Patient Name", "Stage", "Details"]
+
+
+RESULT_KEYS = ["patient_id", "patient_name", "accession_no", "section", "category",
+               "test", "result", "flag", "unit", "ref_range",
+               "registered_on", "reported_on", "contract"]
+ERROR_KEYS = ["patient_id", "patient_name", "stage", "details"]
+UNPARSED_KEYS = ["patient_id", "patient_name", "line"]
+
+
+def read_existing_progress(path: str) -> tuple[list[dict], list[dict], list[dict]]:
+    """Read back a previous run's output (if it exists) so a rerun can resume
+    instead of starting from scratch. Returns (results, errors, unparsed) as
+    lists of dicts, matching the shape main.py builds them in. Old error rows
+    are intentionally dropped - patients not yet successfully completed will
+    simply be retried and get fresh errors if they fail again."""
+    if not Path(path).exists():
+        return [], [], []
+
+    try:
+        wb = load_workbook(path, data_only=True)
+    except Exception:
+        return [], [], []
+
+    def read_sheet(name, keys):
+        if name not in wb.sheetnames:
+            return []
+        ws = wb[name]
+        rows = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row is None or all(v is None for v in row):
+                continue
+            rows.append({k: ("" if v is None else v) for k, v in zip(keys, row)})
+        return rows
+
+    results = read_sheet("Lab Results", RESULT_KEYS)
+    unparsed = read_sheet("Unparsed Lines", UNPARSED_KEYS)
+    return results, [], unparsed
+
+
+def get_completed_patient_ids(results: list[dict]) -> set[str]:
+    return {str(r["patient_id"]) for r in results if r.get("patient_id")}
 
 
 def write_master_workbook(output_path: str, all_results: list[dict],

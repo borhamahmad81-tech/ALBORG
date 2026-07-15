@@ -29,7 +29,10 @@ from browser import (
     launch_browser, ensure_logged_in, search_patient, get_result_rows,
     pick_target_row, fetch_report_pdf, dump_debug, DEFAULT_PROFILE_DIR,
 )
-from excel_io import read_patient_list, write_master_workbook
+from excel_io import (
+    read_patient_list, write_master_workbook,
+    read_existing_progress, get_completed_patient_ids,
+)
 from pdf_parser import parse_lab_pdf
 
 
@@ -49,6 +52,10 @@ def parse_args():
                         "after you've logged in at least once).")
     p.add_argument("--debug", action="store_true",
                    help="Save a screenshot + HTML dump of the search page on failure.")
+    p.add_argument("--restart", action="store_true",
+                   help="Ignore any existing output file and start over from patient 1. "
+                        "By default, if --output already exists, already-completed "
+                        "patients are skipped and the run resumes from where it left off.")
     return p.parse_args()
 
 
@@ -105,12 +112,28 @@ def main():
         sys.exit(1)
     print(f"Loaded {len(patients)} patients from {args.input}")
 
-    pw, context = launch_browser(headless=args.headless)
-    page = context.new_page()
-
     all_results: list[dict] = []
     errors: list[dict] = []
     unparsed: list[dict] = []
+
+    if args.restart:
+        Path(args.output).unlink(missing_ok=True)
+    else:
+        all_results, _old_errors, unparsed = read_existing_progress(args.output)
+        done_ids = get_completed_patient_ids(all_results)
+        if done_ids:
+            remaining = [p for p in patients if p.patient_id not in done_ids]
+            print(f"Found existing '{args.output}' with {len(done_ids)} patients already "
+                  f"done - resuming with the remaining {len(remaining)}. "
+                  "(Use --restart to ignore this and start over.)")
+            patients = remaining
+
+    if not patients:
+        print("Nothing left to do - every patient is already in the output file.")
+        sys.exit(0)
+
+    pw, context = launch_browser(headless=args.headless)
+    page = context.new_page()
 
     try:
         ensure_logged_in(context, page)
@@ -208,7 +231,12 @@ def main():
                     dump_debug(page, f"error_{patient.patient_id}")
                 print(f"    !! ERROR: {exc}")
 
-            time.sleep(1)  # be polite to the portal between patients
+            try:
+                write_master_workbook(args.output, all_results, errors, unparsed)
+            except Exception as save_exc:
+                print(f"    (warning: could not checkpoint-save this round: {save_exc})")
+
+            time.sleep(2)  # be polite to the portal between patients
 
     finally:
         context.close()
