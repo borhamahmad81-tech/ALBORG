@@ -228,61 +228,84 @@ def pick_target_row(rows: list[ResultRow], month_filter: str | None,
 
 
 def fetch_report_pdf(context: BrowserContext, page: Page, row: ResultRow) -> bytes:
-    """Click the Report link for the given row and capture the raw PDF bytes
-    from the network response of the new tab that opens."""
+    """Click the Report link for the given row, wait for the embedded PDF
+    viewer to load (this can take a few seconds for a real report), then
+    click the viewer's built-in 'PDF' button and capture the resulting
+    browser download - this is the same mechanism a human clicking it would
+    trigger, so it's the most reliable way to get the actual file."""
     rows_locator = page.get_by_role("row")
     target_row = rows_locator.nth(row.row_index)
     report_link = target_row.get_by_text("Report", exact=True)
 
-    pdf_bytes_holder: dict = {}
-
-    def handle_response(response):
-        try:
-            ctype = response.headers.get("content-type", "")
-            if "pdf" in ctype.lower() and "pdf" not in pdf_bytes_holder:
-                pdf_bytes_holder["pdf"] = response.body()
-        except Exception:
-            pass
-
     with context.expect_page(timeout=20000) as new_page_info:
         report_link.click()
-    new_page = new_page_info.value
-    new_page.on("response", handle_response)
+    viewer_page = new_page_info.value
 
     try:
-        new_page.wait_for_load_state("networkidle", timeout=20000)
+        viewer_page.wait_for_load_state("load", timeout=30000)
     except PWTimeout:
         pass
+    # Give the embedded viewer time to actually render the report - real
+    # reports can take a few seconds, per live testing.
+    viewer_page.wait_for_timeout(4000)
 
-    # Give any late PDF network responses a moment to arrive.
-    deadline = time.time() + 10
-    while "pdf" not in pdf_bytes_holder and time.time() < deadline:
-        time.sleep(0.5)
+    pdf_bytes = _download_via_pdf_button(viewer_page)
 
-    if "pdf" not in pdf_bytes_holder:
-        # Fallback: some viewers embed the PDF in an <embed>/<iframe> whose
-        # src we can fetch directly via the page's own request context.
-        src = None
-        for sel in ("embed[type='application/pdf']", "iframe"):
-            try:
-                src = new_page.locator(sel).first.get_attribute("src", timeout=2000)
-                if src:
-                    break
-            except PWTimeout:
-                continue
-        if src:
-            resp = new_page.request.get(src)
-            pdf_bytes_holder["pdf"] = resp.body()
+    if pdf_bytes is None:
+        # Fallback: fetch the resolved report URL directly with the same
+        # session cookies, in case the PDF button isn't found this time.
+        report_url = viewer_page.url
+        referer = page.url
+        pdf_bytes = _direct_fetch(context, report_url, referer)
+        if not pdf_bytes.startswith(b"%PDF"):
+            html_text = pdf_bytes.decode("utf-8", errors="ignore")
+            nested_url = _find_nested_report_url(html_text, report_url)
+            if nested_url:
+                pdf_bytes = _direct_fetch(context, nested_url, referer)
 
-    new_page.close()
+    viewer_page.close()
+    return pdf_bytes
 
-    if "pdf" not in pdf_bytes_holder:
-        raise RuntimeError(
-            "Could not capture the PDF response for this report. "
-            "Run with debug=True to save a screenshot/HTML for troubleshooting."
-        )
 
-    return pdf_bytes_holder["pdf"]
+def _download_via_pdf_button(viewer_page: Page) -> bytes | None:
+    """Click the viewer's blue 'PDF' button (confirmed present in the Al
+    Borg viewer) and capture the real file it downloads. Returns None if the
+    button can't be found/clicked, so the caller can fall back."""
+    try:
+        pdf_button = viewer_page.get_by_role("button", name=re.compile(r"^PDF$", re.I))
+        if pdf_button.count() == 0:
+            pdf_button = viewer_page.get_by_text("PDF", exact=True)
+        pdf_button.first.wait_for(state="visible", timeout=15000)
+    except PWTimeout:
+        return None
+
+    try:
+        with viewer_page.expect_download(timeout=20000) as download_info:
+            pdf_button.first.click()
+        download = download_info.value
+        return Path(download.path()).read_bytes()
+    except Exception:
+        return None
+
+
+def _direct_fetch(context: BrowserContext, url: str, referer: str) -> bytes:
+    resp = context.request.get(url, headers={"Referer": referer})
+    if not resp.ok:
+        raise RuntimeError(f"Report request failed: HTTP {resp.status} for {url}")
+    return resp.body()
+
+
+def _find_nested_report_url(html_text: str, base_url: str) -> str | None:
+    from urllib.parse import urljoin
+    for pattern in (
+        r'<embed[^>]+src=["\']([^"\']+)["\']',
+        r'<iframe[^>]+src=["\']([^"\']+)["\']',
+        r'<object[^>]+data=["\']([^"\']+)["\']',
+    ):
+        m = re.search(pattern, html_text, re.IGNORECASE)
+        if m:
+            return urljoin(base_url, m.group(1))
+    return None
 
 
 def dump_debug(page: Page, name: str) -> None:
