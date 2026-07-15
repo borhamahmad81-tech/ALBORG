@@ -51,6 +51,7 @@ def launch_browser(headless: bool = False, profile_dir: Path = DEFAULT_PROFILE_D
     itself. Only Playwright's small internal driver is needed, which the
     build bundles; if it's somehow missing we surface a clear message."""
     profile_dir.mkdir(parents=True, exist_ok=True)
+    _clear_stale_profile_locks(profile_dir)
 
     try:
         pw = sync_playwright().start()
@@ -86,6 +87,29 @@ def launch_browser(headless: bool = False, profile_dir: Path = DEFAULT_PROFILE_D
     return pw, context
 
 
+def _clear_stale_profile_locks(profile_dir: Path) -> None:
+    """If a previous run crashed instead of shutting down cleanly, Chromium
+    can leave lock files behind that prevent the profile from opening again.
+    Since this profile folder is dedicated to this program, it's safe to
+    clear these before every launch."""
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        try:
+            (profile_dir / name).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def close_extra_tabs(context: BrowserContext, keep_page: Page) -> None:
+    """Safety net: close any tab other than the main search tab. Guards
+    against leftover report tabs from an earlier error piling up."""
+    for p in list(context.pages):
+        if p is not keep_page and not p.is_closed():
+            try:
+                p.close()
+            except Exception:
+                pass
+
+
 def ensure_logged_in(context: BrowserContext, page: Page, timeout_seconds: int = 300) -> None:
     """Navigate to the site and, if a login form appears, pause and wait for
     the user to log in manually. Only needed the first time per profile."""
@@ -97,29 +121,51 @@ def ensure_logged_in(context: BrowserContext, page: Page, timeout_seconds: int =
     print(">> Login required. Please log in to the Al Borg portal in the "
           "browser window that just opened. Waiting up to "
           f"{timeout_seconds}s for the Search Criteria page to appear...")
+    print(">> IMPORTANT: don't close that browser window - just log in inside it.")
 
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
-        if _on_search_page(page):
+        status = _on_search_page(page)
+        if status is True:
             print(">> Logged in. This session is now saved for future runs.")
             return
+        if status is None:
+            raise RuntimeError(
+                "The browser window was closed (or crashed) while waiting for you "
+                "to log in. Please run the program again and leave the browser "
+                "window open until it starts searching patients on its own."
+            )
         time.sleep(1.5)
 
     raise TimeoutError("Timed out waiting for manual login. Re-run and log in faster, "
                         "or increase timeout_seconds.")
 
 
-def _on_search_page(page: Page) -> bool:
+def _on_search_page(page: Page) -> bool | None:
+    """Returns True if the search page is visible, False if not (yet), or
+    None if the page/browser itself has been closed."""
     try:
         return page.get_by_text("Search Criteria").first.is_visible(timeout=2000)
     except PWTimeout:
         return False
+    except Exception as exc:
+        if "closed" in str(exc).lower():
+            return None
+        return False
 
 
 def search_patient(page: Page, patient_id: str) -> None:
-    """Fill the Patient No. field and click Search."""
-    if not _on_search_page(page):
-        page.goto(SITE_URL, wait_until="domcontentloaded")
+    """Fill the Patient No. field and click Search.
+
+    Always reloads a fresh copy of the search page first, so results and
+    field values from the PREVIOUS patient can never linger and get picked
+    up by mistake."""
+    page.goto(SITE_URL, wait_until="domcontentloaded")
+    # Let the search form finish rendering.
+    try:
+        page.get_by_text("Search Criteria").first.wait_for(state="visible", timeout=15000)
+    except PWTimeout:
+        pass
 
     patient_field = _find_patient_no_field(page)
     patient_field.click()
@@ -130,7 +176,11 @@ def search_patient(page: Page, patient_id: str) -> None:
     search_button.click()
 
     # Wait for the results table (or a "no results" state) to render.
-    page.wait_for_load_state("networkidle", timeout=20000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=20000)
+    except PWTimeout:
+        pass
+    page.wait_for_timeout(1500)
 
 
 def _find_patient_no_field(page: Page):
@@ -242,29 +292,39 @@ def fetch_report_pdf(context: BrowserContext, page: Page, row: ResultRow) -> byt
     viewer_page = new_page_info.value
 
     try:
-        viewer_page.wait_for_load_state("load", timeout=30000)
-    except PWTimeout:
-        pass
-    # Give the embedded viewer time to actually render the report - real
-    # reports can take a few seconds, per live testing.
-    viewer_page.wait_for_timeout(4000)
+        try:
+            viewer_page.wait_for_load_state("load", timeout=30000)
+        except PWTimeout:
+            pass
+        # Give the embedded viewer time to actually render the report - real
+        # reports can take a few seconds, per live testing.
+        viewer_page.wait_for_timeout(4000)
 
-    pdf_bytes = _download_via_pdf_button(viewer_page)
+        pdf_bytes = _download_via_pdf_button(viewer_page)
 
-    if pdf_bytes is None:
-        # Fallback: fetch the resolved report URL directly with the same
-        # session cookies, in case the PDF button isn't found this time.
-        report_url = viewer_page.url
-        referer = page.url
-        pdf_bytes = _direct_fetch(context, report_url, referer)
-        if not pdf_bytes.startswith(b"%PDF"):
-            html_text = pdf_bytes.decode("utf-8", errors="ignore")
-            nested_url = _find_nested_report_url(html_text, report_url)
-            if nested_url:
-                pdf_bytes = _direct_fetch(context, nested_url, referer)
+        if pdf_bytes is None:
+            # Fallback: fetch the resolved report URL directly with the same
+            # session cookies, in case the PDF button isn't found this time.
+            report_url = viewer_page.url
+            referer = page.url
+            pdf_bytes = _direct_fetch(context, report_url, referer)
+            if not pdf_bytes.startswith(b"%PDF"):
+                html_text = pdf_bytes.decode("utf-8", errors="ignore")
+                nested_url = _find_nested_report_url(html_text, report_url)
+                if nested_url:
+                    pdf_bytes = _direct_fetch(context, nested_url, referer)
 
-    viewer_page.close()
-    return pdf_bytes
+        return pdf_bytes
+    finally:
+        # No matter what happened above (success, error, or a mid-step
+        # crash), always close this tab - leftover tabs from failed patients
+        # were piling up and could crash the whole run if one got closed
+        # manually while still in use.
+        try:
+            if not viewer_page.is_closed():
+                viewer_page.close()
+        except Exception:
+            pass
 
 
 def _download_via_pdf_button(viewer_page: Page) -> bytes | None:
