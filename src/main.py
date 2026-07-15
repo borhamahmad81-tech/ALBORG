@@ -145,12 +145,41 @@ def main():
 
                 pdf_bytes = fetch_report_pdf(context, page, target)
 
+                if not pdf_bytes.startswith(b"%PDF"):
+                    saved_note = ""
+                    if args.debug:
+                        Path("debug").mkdir(exist_ok=True)
+                        bad_path = Path("debug") / f"not_a_pdf_{patient.patient_id}.bin"
+                        bad_path.write_bytes(pdf_bytes)
+                        saved_note = f" Saved a copy to {bad_path} - send this file over."
+                    raise RuntimeError(
+                        f"Downloaded report was not a valid PDF ({len(pdf_bytes)} bytes)."
+                        + saved_note
+                        + (" Re-run with --debug to save a copy next time." if not args.debug else "")
+                    )
+
                 with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
                     tmp.write(pdf_bytes)
                     tmp_path = tmp.name
 
                 parsed = parse_lab_pdf(tmp_path)
                 Path(tmp_path).unlink(missing_ok=True)
+
+                if parsed.patient_no and parsed.patient_no != patient.patient_id:
+                    errors.append({
+                        "patient_id": patient.patient_id, "patient_name": patient.name,
+                        "stage": "id_mismatch",
+                        "details": f"Searched for {patient.patient_id} but the downloaded "
+                                   f"PDF's own 'Patient No.' field says {parsed.patient_no}. "
+                                   "Results NOT saved - re-check this patient manually.",
+                    })
+                    if args.debug:
+                        Path("debug").mkdir(exist_ok=True)
+                        Path("debug") / f"id_mismatch_{patient.patient_id}.pdf"
+                        (Path("debug") / f"id_mismatch_{patient.patient_id}.pdf").write_bytes(pdf_bytes)
+                    print(f"    !! ID MISMATCH: searched {patient.patient_id}, "
+                          f"PDF says {parsed.patient_no} - skipped")
+                    continue
 
                 for r in parsed.results:
                     all_results.append({
