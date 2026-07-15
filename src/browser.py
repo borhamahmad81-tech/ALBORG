@@ -67,6 +67,10 @@ def launch_browser(headless: bool = False, profile_dir: Path = DEFAULT_PROFILE_D
         user_data_dir=str(profile_dir),
         headless=headless,
         viewport={"width": 1400, "height": 900},
+        # Suppress the "file downloaded" notification bubble that pops up in
+        # the corner after each report download - possible source of focus
+        # interference between patients.
+        args=["--disable-features=DownloadBubble,DownloadBubbleV2"],
     )
 
     # Prefer the user's installed Microsoft Edge. If that can't launch for any
@@ -161,6 +165,7 @@ def search_patient(page: Page, patient_id: str) -> None:
     field values from the PREVIOUS patient can never linger and get picked
     up by mistake."""
     page.goto(SITE_URL, wait_until="domcontentloaded")
+    page.bring_to_front()  # make sure THIS tab has focus, not any popup/notification
     # Let the search form finish rendering.
     try:
         page.get_by_text("Search Criteria").first.wait_for(state="visible", timeout=15000)
@@ -168,6 +173,7 @@ def search_patient(page: Page, patient_id: str) -> None:
         pass
 
     patient_field = _find_patient_no_field(page)
+    page.bring_to_front()
     patient_field.click(timeout=8000)
     patient_field.fill("", timeout=8000)
     patient_field.fill(patient_id, timeout=8000)
