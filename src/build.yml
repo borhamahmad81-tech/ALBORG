@@ -1,0 +1,60 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Install Playwright browser into project folder
+        env:
+          # Put the downloaded browser inside the repo so PyInstaller can bundle it.
+          PLAYWRIGHT_BROWSERS_PATH: "0"
+        run: |
+          playwright install chromium
+
+      - name: Build EXE
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: "0"
+        run: |
+          pyinstaller --onefile --name AlborgLabFetcher `
+            --collect-all playwright `
+            --add-data "src;src" `
+            src/main.py
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AlborgLabFetcher-windows
+          path: dist/AlborgLabFetcher.exe
+
+      - name: Create GitHub Release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: dist/AlborgLabFetcher.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

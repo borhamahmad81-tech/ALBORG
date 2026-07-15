@@ -154,4 +154,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        import traceback
+        print("\n" + "=" * 60)
+        print("The program hit an error and stopped. Details below:")
+        print("=" * 60)
+        traceback.print_exc()
+    finally:
+        # Keep the window open so the message is readable when double-clicked.
+        try:
+            input("\nPress Enter to close this window...")
+        except EOFError:
+            pass

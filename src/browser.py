@@ -44,15 +44,45 @@ class ResultRow:
 
 
 def launch_browser(headless: bool = False, profile_dir: Path = DEFAULT_PROFILE_DIR):
-    """Launch (or reuse) a persistent Edge profile. Returns (playwright, context)."""
+    """Launch (or reuse) a persistent Edge profile. Returns (playwright, context).
+
+    Uses the copy of Microsoft Edge already installed on the machine
+    (channel='msedge'), so nothing extra needs downloading for the browser
+    itself. Only Playwright's small internal driver is needed, which the
+    build bundles; if it's somehow missing we surface a clear message."""
     profile_dir.mkdir(parents=True, exist_ok=True)
-    pw = sync_playwright().start()
-    context = pw.chromium.launch_persistent_context(
+
+    try:
+        pw = sync_playwright().start()
+    except Exception as exc:
+        raise RuntimeError(
+            "Playwright's internal driver could not start. This usually means "
+            "the driver wasn't bundled into the .exe. If you built it yourself, "
+            "make sure the build ran 'playwright install' and used "
+            "--collect-all playwright. Original error: " + str(exc)
+        )
+
+    common_args = dict(
         user_data_dir=str(profile_dir),
-        channel="msedge",
         headless=headless,
         viewport={"width": 1400, "height": 900},
     )
+
+    # Prefer the user's installed Microsoft Edge. If that can't launch for any
+    # reason, fall back to the Chromium engine bundled inside the .exe so the
+    # program still works out of the box.
+    try:
+        context = pw.chromium.launch_persistent_context(channel="msedge", **common_args)
+    except Exception:
+        try:
+            context = pw.chromium.launch_persistent_context(**common_args)
+        except Exception as exc:
+            pw.stop()
+            raise RuntimeError(
+                "Could not launch a browser (tried Edge, then bundled Chromium). "
+                "Original error: " + str(exc)
+            )
+
     return pw, context
 
 
