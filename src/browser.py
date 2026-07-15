@@ -166,34 +166,61 @@ def _on_search_page(page: Page) -> bool | None:
 
 
 def search_patient(page: Page, patient_id: str) -> None:
-    """Fill the Patient No. field and click Search.
+    """Fill the Patient No. field (id='patientNo') and click Search.
 
-    Always reloads a fresh copy of the search page first, so results and
-    field values from the PREVIOUS patient can never linger and get picked
-    up by mistake."""
-    page.goto(SITE_URL, wait_until="domcontentloaded")
-    page.bring_to_front()  # make sure THIS tab has focus, not any popup/notification
-    # Let the search form finish rendering.
+    This site is an AngularJS single-page app. Hard-reloading it with a
+    navigation between every patient was tearing down and rebuilding all its
+    scripts, which crashed the browser connection. So we only load the page
+    ONCE (if we're not already on it), then for each patient just clear the
+    field, type the new ID, and click Search - exactly like a human does,
+    staying within the same loaded app."""
+    # Only navigate if we're not already on the search page.
+    on_page = False
     try:
-        page.get_by_text("Search Criteria").first.wait_for(state="visible", timeout=15000)
-    except PWTimeout:
-        pass
+        on_page = page.locator("#patientNo").count() > 0
+    except Exception:
+        on_page = False
 
-    patient_field = _find_patient_no_field(page)
+    if not on_page:
+        page.goto(SITE_URL, wait_until="domcontentloaded")
+        try:
+            page.locator("#patientNo").wait_for(state="visible", timeout=20000)
+        except PWTimeout:
+            pass
+
     page.bring_to_front()
-    patient_field.click(timeout=8000)
-    patient_field.fill("", timeout=8000)
-    patient_field.fill(patient_id, timeout=8000)
 
-    search_button = page.get_by_role("button", name=re.compile("Search", re.I))
-    search_button.click(timeout=8000)
+    field = page.locator("#patientNo")
+    field.click(timeout=8000)
+    field.fill("", timeout=8000)
+    field.fill(patient_id, timeout=8000)
 
-    # Wait for the results table (or a "no results" state) to render.
+    # Click the Search button (ng-click="SearchResult(true)").
+    clicked = False
     try:
-        page.wait_for_load_state("networkidle", timeout=20000)
+        btn = page.locator("[ng-click*='SearchResult']")
+        if btn.count() > 0:
+            btn.first.click(timeout=8000)
+            clicked = True
+    except Exception:
+        pass
+    if not clicked:
+        try:
+            page.get_by_role("button", name=re.compile("Search", re.I)).first.click(timeout=8000)
+            clicked = True
+        except Exception:
+            pass
+    if not clicked:
+        # Last resort: press Enter in the field.
+        field.press("Enter")
+
+    # Wait for the grid to refresh. Angular updates the grid in place, so
+    # give it a moment rather than waiting on navigation.
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
     except PWTimeout:
         pass
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(2500)
 
 
 def _find_patient_no_field(page: Page):
@@ -249,48 +276,119 @@ def _find_patient_no_field(page: Page):
 
 
 def get_result_rows(page: Page) -> list[ResultRow]:
-    """Parse the Results table into structured rows."""
+    """Read the results grid.
+
+    The site uses AngularJS ui-grid, which only renders the visible rows and
+    recycles DOM nodes as you scroll - so scraping <div role='row'> elements
+    misses rows and gives stale indexes. Instead we ask Angular for the
+    grid's underlying data array directly via its scope, which gives us every
+    row reliably regardless of scroll position. Falls back to DOM scraping if
+    the Angular read doesn't work."""
+    data = _read_grid_data_from_angular(page)
+    if data:
+        parsed: list[ResultRow] = []
+        for i, entity in enumerate(data):
+            department = _match_department(str(entity.get("TestDepartment", "")
+                                               or entity.get("Department", "")))
+            if department is None:
+                continue
+            visit_text = str(entity.get("VisitDate", "") or "")
+            visit_dt = _parse_any_date(visit_text)
+            parsed.append(ResultRow(
+                visit_date_text=visit_text,
+                visit_date=visit_dt,
+                accession_no=str(entity.get("Accession", "") or entity.get("AccessionNo", "")),
+                test_department=department,
+                row_index=i,
+                report_url="",  # reports open via JS using row ID, handled in fetch
+            ))
+        if parsed:
+            return parsed
+
+    # --- Fallback: DOM scrape (older behavior) ---
     rows_locator = page.get_by_role("row")
     count = rows_locator.count()
-    parsed: list[ResultRow] = []
-
+    parsed = []
     for i in range(count):
         row = rows_locator.nth(i)
-        text = row.inner_text()
+        try:
+            text = row.inner_text()
+        except Exception:
+            continue
         if not text.strip() or "Visit Date" in text:
-            continue  # header row
-
-        visit_date_text = _extract_visit_date(text)
-        visit_date = _parse_visit_date(visit_date_text) if visit_date_text else None
-        accession_no = _extract_first_number(text)
+            continue
         department = _extract_department(text)
-
         if department is None:
             continue
-
-        # Try to grab the Report link's href directly, so we can fetch the
-        # PDF without opening a viewer tab (that tab-open sequence was
-        # crashing the browser connection between patients).
-        report_url = ""
-        try:
-            link = row.locator("a").filter(has_text=re.compile("Report", re.I))
-            if link.count() > 0:
-                href = link.first.get_attribute("href", timeout=2000)
-                if href:
-                    report_url = href
-        except Exception:
-            pass
-
+        visit_date_text = _extract_visit_date(text)
         parsed.append(ResultRow(
             visit_date_text=visit_date_text or "",
-            visit_date=visit_date,
-            accession_no=accession_no or "",
+            visit_date=_parse_visit_date(visit_date_text) if visit_date_text else None,
+            accession_no=_extract_first_number(text) or "",
             test_department=department,
             row_index=i,
-            report_url=report_url,
+            report_url="",
         ))
-
     return parsed
+
+
+def _read_grid_data_from_angular(page: Page):
+    """Pull the ui-grid's full data array out of Angular's scope. Returns a
+    list of row dicts, or None if it can't be read."""
+    js = r"""
+    () => {
+      try {
+        if (!window.angular) return null;
+        // Find the ui-grid element and read its grid data.
+        const gridEl = document.querySelector('[ui-grid]') ||
+                       document.querySelector('.ui-grid');
+        if (gridEl && window.angular.element) {
+          const scope = window.angular.element(gridEl).scope();
+          if (scope) {
+            // Try common locations for the grid's data array.
+            const opts = scope.gridOptions || (scope.grid && scope.grid.options) ||
+                         (scope.$parent && scope.$parent.gridOptions);
+            if (opts && Array.isArray(opts.data)) {
+              return opts.data.map(r => JSON.parse(JSON.stringify(r)));
+            }
+            if (scope.grid && Array.isArray(scope.grid.rows)) {
+              return scope.grid.rows.map(row => JSON.parse(JSON.stringify(row.entity)));
+            }
+          }
+        }
+        return null;
+      } catch (e) { return null; }
+    }
+    """
+    try:
+        return page.evaluate(js)
+    except Exception:
+        return None
+
+
+def _match_department(text: str) -> str | None:
+    known = ["All Services", "Chemistry Unit", "Complete Blood Count",
+             "MISC. Unit", "Hormones Unit", "Serology Unit", "Urine Unit",
+             "Haematology Unit", "Hematology Unit"]
+    for dep in known:
+        if dep.lower() in (text or "").lower():
+            return "All Services" if dep == "All Services" else dep
+    return None
+
+
+def _parse_any_date(text: str) -> datetime | None:
+    text = (text or "").strip()
+    for fmt in ("%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(text[:len(text)], fmt)
+        except ValueError:
+            continue
+    # Try ISO-ish with milliseconds/timezone chopped.
+    m = re.search(r"(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s*[AP]M)", text)
+    if m:
+        return _parse_visit_date(m.group(1))
+    return None
 
 
 def _extract_visit_date(row_text: str) -> str | None:
@@ -345,65 +443,44 @@ def pick_target_row(rows: list[ResultRow], month_filter: str | None,
 
 
 def fetch_report_pdf(context: BrowserContext, page: Page, row: ResultRow) -> bytes:
-    """Get the report PDF.
+    """Open the report for the given row and return the PDF bytes.
 
-    PRIMARY method (no new tab): if we captured the Report link's URL from
-    the results table, fetch it directly using the logged-in session. This
-    avoids opening Edge's PDF viewer tab entirely - that tab open/close
-    sequence was crashing the browser connection between patients.
-
-    FALLBACK method: if we don't have a URL or the direct fetch doesn't yield
-    a PDF, fall back to the old approach of clicking Report and reading the
-    viewer tab."""
+    The report opens via an Angular ng-click handler
+    (reportLinkClicked(row.entity.ID, ...)) in a NEW tab showing the viewer.
+    We find the correct 'All Services' Report link in the DOM by matching on
+    the visit date, click it, grab the new tab's URL, fetch that URL's bytes
+    in the background with the logged-in session, then close the tab right
+    away. We deliberately do NOT interact with the PDF viewer's controls."""
     referer = page.url
 
-    # --- Primary: direct fetch, no tab ---
-    if row.report_url:
-        full_url = row.report_url
-        if full_url.startswith("/"):
-            from urllib.parse import urljoin
-            full_url = urljoin(SITE_URL, full_url)
-        try:
-            body = _direct_fetch(context, full_url, referer)
-            if body.startswith(b"%PDF"):
-                return body
-            # Might be an HTML wrapper pointing at the real PDF.
-            html_text = body.decode("utf-8", errors="ignore")
-            nested = _find_nested_report_url(html_text, full_url)
-            if nested:
-                body2 = _direct_fetch(context, nested, referer)
-                if body2.startswith(b"%PDF"):
-                    return body2
-        except Exception:
-            pass  # fall through to tab-based method
+    report_link = _find_report_link_for_row(page, row)
+    if report_link is None:
+        raise RuntimeError("Could not locate the Report link for the chosen "
+                           "All Services row in the results grid.")
 
-    # --- Fallback: click Report, read the viewer tab ---
-    rows_locator = page.get_by_role("row")
-    target_row = rows_locator.nth(row.row_index)
-    report_link = target_row.get_by_text("Report", exact=True)
-
-    with context.expect_page(timeout=20000) as new_page_info:
-        report_link.click()
+    with context.expect_page(timeout=25000) as new_page_info:
+        report_link.click(timeout=8000)
     viewer_page = new_page_info.value
 
     try:
         try:
-            viewer_page.wait_for_load_state("load", timeout=30000)
+            viewer_page.wait_for_load_state("domcontentloaded", timeout=20000)
         except PWTimeout:
             pass
-        viewer_page.wait_for_timeout(4000)
+        viewer_page.wait_for_timeout(2500)
 
         report_url = viewer_page.url
+
+        # Fetch the report bytes using the browser's own authenticated
+        # request context (no viewer interaction).
         pdf_bytes = _direct_fetch(context, report_url, referer)
         if not pdf_bytes.startswith(b"%PDF"):
             html_text = pdf_bytes.decode("utf-8", errors="ignore")
             nested_url = _find_nested_report_url(html_text, report_url)
             if nested_url:
-                pdf_bytes = _direct_fetch(context, nested_url, referer)
-            else:
-                maybe = _download_via_pdf_button(viewer_page)
-                if maybe is not None:
-                    pdf_bytes = maybe
+                nested_bytes = _direct_fetch(context, nested_url, referer)
+                if nested_bytes.startswith(b"%PDF"):
+                    pdf_bytes = nested_bytes
 
         return pdf_bytes
     finally:
@@ -412,6 +489,44 @@ def fetch_report_pdf(context: BrowserContext, page: Page, row: ResultRow) -> byt
                 viewer_page.close()
         except Exception:
             pass
+
+
+def _find_report_link_for_row(page: Page, row: ResultRow):
+    """Find the clickable 'Report' element in the grid row matching this
+    ResultRow (matched by its visit date text, then department). Returns a
+    locator or None."""
+    # All the Report links in the grid.
+    links = page.locator("[ng-click*='reportLinkClicked']")
+    try:
+        n = links.count()
+    except Exception:
+        n = 0
+
+    # Prefer matching by the row's visit date text appearing in the same
+    # grid row as the link.
+    if row.visit_date_text:
+        for i in range(n):
+            link = links.nth(i)
+            try:
+                # Walk up to the row container and check its text.
+                container = link.locator("xpath=ancestor::div[contains(@class,'ui-grid-row')][1]")
+                if container.count() == 0:
+                    container = link.locator("xpath=ancestor::tr[1]")
+                text = container.first.inner_text(timeout=2000) if container.count() else ""
+                if row.accession_no and row.accession_no in text:
+                    return link
+                if row.visit_date_text and row.visit_date_text[:10] in text \
+                        and "All Services".lower() in text.lower():
+                    return link
+            except Exception:
+                continue
+
+    # Fallback: the row_index-th report link.
+    if 0 <= row.row_index < n:
+        return links.nth(row.row_index)
+    if n > 0:
+        return links.first
+    return None
 
 
 def _download_via_pdf_button(viewer_page: Page) -> bytes | None:
