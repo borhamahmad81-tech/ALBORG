@@ -168,12 +168,12 @@ def search_patient(page: Page, patient_id: str) -> None:
         pass
 
     patient_field = _find_patient_no_field(page)
-    patient_field.click()
-    patient_field.fill("")
-    patient_field.fill(patient_id)
+    patient_field.click(timeout=8000)
+    patient_field.fill("", timeout=8000)
+    patient_field.fill(patient_id, timeout=8000)
 
     search_button = page.get_by_role("button", name=re.compile("Search", re.I))
-    search_button.click()
+    search_button.click(timeout=8000)
 
     # Wait for the results table (or a "no results" state) to render.
     try:
@@ -184,15 +184,55 @@ def search_patient(page: Page, patient_id: str) -> None:
 
 
 def _find_patient_no_field(page: Page):
-    """Locate the 'Patient No.' input robustly (label text, then fallback
-    to the input right after the 'Patient No.' text label)."""
+    """Locate the 'Patient No.' input, trying several real strategies in
+    order and actually checking each one matches something (.count() > 0)
+    before using it - a locator that LOOKS valid but matches nothing was
+    previously causing the whole run to hang on click() instead of failing
+    fast, so every strategy here is verified before use."""
+
+    # 1. Proper <label for="..."> association.
     try:
-        return page.get_by_label(re.compile("Patient No", re.I))
+        loc = page.get_by_label(re.compile("Patient No", re.I))
+        if loc.count() > 0:
+            return loc.first
     except Exception:
         pass
-    # Fallback: find the label element, then the nearby input.
-    label = page.get_by_text(re.compile(r"^Patient No\.?$"), exact=False).first
-    return label.locator("xpath=following::input[1]")
+
+    # 2. ASP.NET-style forms often give inputs descriptive IDs/names even
+    # without a real <label> link, e.g. id="...txtPatientNo...".
+    try:
+        loc = page.locator(
+            "input[id*='patient' i], input[name*='patient' i], "
+            "input[id*='PatNo' i], input[name*='PatNo' i]"
+        )
+        if loc.count() > 0:
+            return loc.first
+    except Exception:
+        pass
+
+    # 3. Placeholder text.
+    try:
+        loc = page.get_by_placeholder(re.compile("Patient", re.I))
+        if loc.count() > 0:
+            return loc.first
+    except Exception:
+        pass
+
+    # 4. Plain visible text label, then the nearest input after it in the DOM.
+    try:
+        label = page.get_by_text(re.compile(r"Patient No\.?", re.I)).first
+        if label.count() > 0:
+            candidate = label.locator("xpath=following::input[1]")
+            if candidate.count() > 0:
+                return candidate
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Could not find the 'Patient No.' field on the search page using any "
+        "known strategy. Run with --debug so a screenshot/HTML of the page "
+        "gets saved - send that over and I'll pinpoint the exact field."
+    )
 
 
 def get_result_rows(page: Page) -> list[ResultRow]:
