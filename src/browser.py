@@ -461,9 +461,23 @@ def fetch_report_pdf(context: BrowserContext, page: Page, row: ResultRow) -> byt
         raise RuntimeError("Could not locate the Report link for the chosen "
                            "All Services row in the results grid.")
 
-    with context.expect_page(timeout=25000) as new_page_info:
-        report_link.click(timeout=8000)
-    viewer_page = new_page_info.value
+    viewer_page = None
+    for attempt in range(2):
+        try:
+            with context.expect_page(timeout=25000) as new_page_info:
+                report_link.click(timeout=8000)
+            viewer_page = new_page_info.value
+            break
+        except PWTimeout:
+            if attempt == 0:
+                page.wait_for_timeout(1500)
+                continue
+            raise RuntimeError(
+                "The report tab did not open in time after clicking Report. "
+                "This patient will be retried on the next browser restart."
+            )
+    if viewer_page is None:
+        raise RuntimeError("Report tab failed to open.")
 
     try:
         try:
@@ -474,16 +488,36 @@ def fetch_report_pdf(context: BrowserContext, page: Page, row: ResultRow) -> byt
 
         report_url = viewer_page.url
 
-        # Fetch the report bytes using the browser's own authenticated
-        # request context (no viewer interaction).
-        pdf_bytes = _direct_fetch(context, report_url, referer)
+        # The viewer page (ReportViewer.htm?<id>) loads the real PDF into a
+        # hidden frame from Report_PDF.aspx?<same id>. So we take everything
+        # after "ReportViewer.htm?" and fetch Report_PDF.aspx with it.
+        pdf_bytes = b""
+        if "ReportViewer.htm?" in report_url:
+            query = report_url.split("ReportViewer.htm?", 1)[1]
+            from urllib.parse import urljoin
+            base = report_url.split("Pages/Master/", 1)[0]  # site root up to Pages/Master
+            pdf_endpoint = urljoin(report_url, "Report_PDF.aspx?") + query
+            # urljoin can mangle the raw query; build it manually to be safe.
+            viewer_root = report_url.split("ReportViewer.htm?", 1)[0]
+            pdf_endpoint = viewer_root + "Report_PDF.aspx?" + query
+            try:
+                pdf_bytes = _direct_fetch(context, pdf_endpoint, report_url)
+            except Exception:
+                pdf_bytes = b""
+
+        # If that didn't yield a PDF, fall back to fetching the viewer URL and
+        # looking inside for a nested frame source.
         if not pdf_bytes.startswith(b"%PDF"):
-            html_text = pdf_bytes.decode("utf-8", errors="ignore")
-            nested_url = _find_nested_report_url(html_text, report_url)
-            if nested_url:
-                nested_bytes = _direct_fetch(context, nested_url, referer)
-                if nested_bytes.startswith(b"%PDF"):
-                    pdf_bytes = nested_bytes
+            body = _direct_fetch(context, report_url, referer)
+            if body.startswith(b"%PDF"):
+                pdf_bytes = body
+            else:
+                html_text = body.decode("utf-8", errors="ignore")
+                nested_url = _find_nested_report_url(html_text, report_url)
+                if nested_url:
+                    nb = _direct_fetch(context, nested_url, report_url)
+                    if nb.startswith(b"%PDF"):
+                        pdf_bytes = nb
 
         return pdf_bytes
     finally:
