@@ -27,16 +27,7 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Install Playwright browser into project folder
-        env:
-          # Put the downloaded browser inside the repo so PyInstaller can bundle it.
-          PLAYWRIGHT_BROWSERS_PATH: "0"
-        run: |
-          playwright install chromium
-
       - name: Build EXE
-        env:
-          PLAYWRIGHT_BROWSERS_PATH: "0"
         run: |
           pyinstaller --onefile --name AlborgLabFetcher --windowed `
             --collect-all playwright `
