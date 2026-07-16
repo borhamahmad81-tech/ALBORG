@@ -81,18 +81,21 @@ def launch_browser(headless: bool = False, profile_dir: Path = DEFAULT_PROFILE_D
 
     channel = "chrome" if browser_choice == "chrome" else "msedge"
 
-    # Try the chosen browser; if it can't launch, fall back to bundled Chromium
-    # so the program still works out of the box.
+    # Use the browser already installed on the machine (Edge or Chrome). The
+    # engine is no longer bundled into the exe (that made it ~200MB), so the
+    # chosen browser must be installed - virtually all Windows PCs have Edge.
     try:
         context = pw.chromium.launch_persistent_context(channel=channel, **common_args)
-    except Exception:
+    except Exception as exc:
+        # If the requested one isn't found, try the other installed browser.
+        other = "msedge" if channel == "chrome" else "chrome"
         try:
-            context = pw.chromium.launch_persistent_context(**common_args)
-        except Exception as exc:
+            context = pw.chromium.launch_persistent_context(channel=other, **common_args)
+        except Exception:
             pw.stop()
             raise RuntimeError(
-                f"Could not launch {browser_choice} (also tried bundled Chromium). "
-                "Original error: " + str(exc)
+                f"Could not launch {browser_choice}. Make sure Microsoft Edge "
+                f"or Google Chrome is installed on this PC. Original error: {exc}"
             )
 
     return pw, context
