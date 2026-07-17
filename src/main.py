@@ -50,8 +50,8 @@ class _Tee:
 
 from browser import (
     launch_browser, ensure_logged_in, search_patient, get_result_rows,
-    pick_target_row, fetch_report_pdf, dump_debug, close_extra_tabs,
-    DEFAULT_PROFILE_DIR,
+    pick_target_row, pick_all_month_rows, fetch_report_pdf, dump_debug,
+    close_extra_tabs, DEFAULT_PROFILE_DIR,
 )
 from excel_io import (
     read_patient_list, write_master_workbook,
@@ -78,6 +78,10 @@ def parse_args():
                    help="Save a screenshot + HTML dump of the search page on failure.")
     p.add_argument("--browser", default="edge", choices=["edge", "chrome"],
                    help="Which browser to drive: edge (default) or chrome.")
+    p.add_argument("--merge-month", action="store_true",
+                   help="Instead of taking only the single latest All Services "
+                        "report, take ALL All Services reports in the month and "
+                        "merge them, keeping the newest value for each test.")
     p.add_argument("--restart", action="store_true",
                    help="Ignore any existing output file and start over from patient 1. "
                         "By default, if --output already exists, already-completed "
@@ -122,6 +126,55 @@ def _resolve_input_path(input_arg: str) -> str:
     sys.exit(1)
 
 
+def _download_and_parse(context, page, target, patient, args):
+    """Download one report, verify it's a real PDF, parse it, and run the
+    ID cross-check. Returns the parsed report, or None if it failed the PDF
+    check or the ID didn't match (with an error recorded by the caller's
+    exception handling for PDF failures, or here for ID mismatch)."""
+    pdf_bytes = fetch_report_pdf(context, page, target)
+    print(f"    downloaded {len(pdf_bytes)} bytes")
+
+    if not pdf_bytes.startswith(b"%PDF"):
+        Path("debug").mkdir(exist_ok=True)
+        bad_path = Path("debug") / f"not_a_pdf_{patient.patient_id}.html"
+        try:
+            bad_path.write_bytes(pdf_bytes)
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Downloaded report was not a valid PDF ({len(pdf_bytes)} bytes). "
+            f"Saved the content to {bad_path} - send that file over."
+        )
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    parsed = parse_lab_pdf(tmp_path)
+    Path(tmp_path).unlink(missing_ok=True)
+    print(f"    PDF patient no: '{parsed.patient_no}'; "
+          f"parsed {len(parsed.results)} test rows")
+
+    searched_id = str(patient.patient_id).strip()
+    pdf_id = str(parsed.patient_no).strip()
+    if pdf_id and pdf_id != searched_id:
+        if args.debug:
+            Path("debug").mkdir(exist_ok=True)
+            (Path("debug") / f"id_mismatch_{patient.patient_id}.pdf").write_bytes(pdf_bytes)
+        print(f"    !! ID MISMATCH: searched {searched_id}, PDF says {pdf_id} - skipped")
+        # Signal mismatch to caller via a sentinel: return None but record it.
+        raise _IdMismatch(searched_id, pdf_id)
+
+    return parsed
+
+
+class _IdMismatch(Exception):
+    def __init__(self, searched, pdf):
+        self.searched = searched
+        self.pdf = pdf
+        super().__init__(f"ID mismatch searched={searched} pdf={pdf}")
+
+
 def _process_patient(patient, context, page, args, all_results, errors, unparsed):
     """Process a single patient: search, pick the right report, download,
     parse, and record results. Appends to all_results/errors/unparsed in
@@ -143,6 +196,71 @@ def _process_patient(patient, context, page, args, all_results, errors, unparsed
                 dump_debug(page, f"no_results_{patient.patient_id}")
             return
 
+        if getattr(args, "merge_month", False):
+            targets = pick_all_month_rows(rows, args.month, allow_older=args.allow_older)
+            if not targets:
+                errors.append({
+                    "patient_id": patient.patient_id, "patient_name": patient.name,
+                    "stage": "select_row",
+                    "details": f"No 'All Services' report found for {args.month} "
+                               "(no fallback to older months - pass --allow-older to permit that)",
+                })
+                if args.debug:
+                    dump_debug(page, f"no_all_services_{patient.patient_id}")
+                return
+
+            print(f"    merge mode: {len(targets)} All Services report(s) this month")
+            # test name -> chosen row dict (newest visit date wins)
+            merged: dict[str, dict] = {}
+            merged_dates: dict[str, "datetime | None"] = {}
+            all_unparsed: list[str] = []
+            any_ok = False
+
+            for t in targets:
+                try:
+                    parsed = _download_and_parse(context, page, t, patient, args)
+                except _IdMismatch:
+                    continue  # this one report was the wrong patient - skip it
+                if parsed is None:
+                    continue  # a bad/mismatched report - skip, keep going
+                any_ok = True
+                for r in parsed.results:
+                    key = r.test.strip()
+                    # newer visit date wins; if a test is new, add it.
+                    if key not in merged or (t.visit_date and
+                            (merged_dates.get(key) is None or t.visit_date > merged_dates[key])):
+                        merged[key] = {
+                            "patient_id": patient.patient_id, "patient_name": patient.name,
+                            "accession_no": r.accession_no, "section": r.section,
+                            "category": r.category, "test": r.test, "result": r.result,
+                            "flag": r.flag, "unit": r.unit, "ref_range": r.ref_range,
+                            "registered_on": r.registered_on, "reported_on": r.reported_on,
+                            "contract": r.contract,
+                        }
+                        merged_dates[key] = t.visit_date
+                for line in parsed.unparsed_lines:
+                    all_unparsed.append(line)
+
+            if not any_ok:
+                errors.append({
+                    "patient_id": patient.patient_id, "patient_name": patient.name,
+                    "stage": "fetch_or_parse",
+                    "details": "Could not fetch/parse any All Services report this month.",
+                })
+                return
+
+            for row_dict in merged.values():
+                all_results.append(row_dict)
+            for line in all_unparsed:
+                unparsed.append({
+                    "patient_id": patient.patient_id, "patient_name": patient.name,
+                    "line": line,
+                })
+            print(f"    -> merged into {len(merged)} unique tests "
+                  f"from {len(targets)} report(s)")
+            return
+
+        # --- Single-report mode (default) ---
         target = pick_target_row(rows, args.month, allow_older=args.allow_older)
         if target is None:
             errors.append({
@@ -156,46 +274,9 @@ def _process_patient(patient, context, page, args, all_results, errors, unparsed
             return
 
         print(f"    picked All Services row dated {target.visit_date_text}")
-        pdf_bytes = fetch_report_pdf(context, page, target)
-        print(f"    downloaded {len(pdf_bytes)} bytes")
-
-        if not pdf_bytes.startswith(b"%PDF"):
-            Path("debug").mkdir(exist_ok=True)
-            bad_path = Path("debug") / f"not_a_pdf_{patient.patient_id}.html"
-            try:
-                bad_path.write_bytes(pdf_bytes)
-            except Exception:
-                pass
-            raise RuntimeError(
-                f"Downloaded report was not a valid PDF ({len(pdf_bytes)} bytes). "
-                f"Saved the content to {bad_path} - send that file over."
-            )
-
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(pdf_bytes)
-            tmp_path = tmp.name
-
-        parsed = parse_lab_pdf(tmp_path)
-        Path(tmp_path).unlink(missing_ok=True)
-        print(f"    PDF patient no: '{parsed.patient_no}'; "
-              f"parsed {len(parsed.results)} test rows")
-
-        searched_id = str(patient.patient_id).strip()
-        pdf_id = str(parsed.patient_no).strip()
-        if pdf_id and pdf_id != searched_id:
-            errors.append({
-                "patient_id": patient.patient_id, "patient_name": patient.name,
-                "stage": "id_mismatch",
-                "details": f"Searched for {searched_id} but the downloaded "
-                           f"PDF's own 'Patient No.' field says {pdf_id}. "
-                           "Results NOT saved - re-check this patient manually.",
-            })
-            if args.debug:
-                Path("debug").mkdir(exist_ok=True)
-                (Path("debug") / f"id_mismatch_{patient.patient_id}.pdf").write_bytes(pdf_bytes)
-            print(f"    !! ID MISMATCH: searched {searched_id}, "
-                  f"PDF says {pdf_id} - skipped")
-            return
+        parsed = _download_and_parse(context, page, target, patient, args)
+        if parsed is None:
+            return  # error already recorded inside helper
 
         for r in parsed.results:
             all_results.append({
@@ -215,6 +296,14 @@ def _process_patient(patient, context, page, args, all_results, errors, unparsed
 
         print(f"    -> {len(parsed.results)} test results ({target.visit_date_text})")
 
+    except _IdMismatch as mm:
+        errors.append({
+            "patient_id": patient.patient_id, "patient_name": patient.name,
+            "stage": "id_mismatch",
+            "details": f"Searched for {mm.searched} but the downloaded PDF's own "
+                       f"'Patient No.' field says {mm.pdf}. Results NOT saved - "
+                       "re-check this patient manually.",
+        })
     except Exception as exc:  # one bad patient shouldn't kill the batch
         msg = str(exc).lower()
         connection_dead = any(s in msg for s in (

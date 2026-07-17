@@ -20,11 +20,12 @@ from tkinter import filedialog, ttk
 def run_gui():
     root = tk.Tk()
     root.title("Al Borg Lab Fetcher")
-    root.geometry("640x520")
+    root.geometry("640x600")
 
     state = {"input_path": tk.StringVar(),
              "browser": tk.StringVar(value="edge"),
              "month": tk.StringVar(value=date.today().strftime("%Y-%m")),
+             "merge": tk.BooleanVar(value=False),
              "running": False}
 
     pad = {"padx": 12, "pady": 6}
@@ -57,6 +58,15 @@ def run_gui():
     frm_month.pack(fill="x", **pad)
     ttk.Entry(frm_month, textvariable=state["month"], width=12).pack(side="left", padx=8, pady=8)
     ttk.Label(frm_month, text="format: YYYY-MM (e.g. 2026-07)").pack(side="left")
+
+    # --- Mode ---
+    frm_mode = ttk.LabelFrame(root, text="4. What to collect for each patient")
+    frm_mode.pack(fill="x", **pad)
+    ttk.Radiobutton(frm_mode, text="Latest report only (this month)",
+                    value=False, variable=state["merge"]).pack(anchor="w", padx=12, pady=(8, 2))
+    ttk.Radiobutton(frm_mode,
+                    text="Merge ALL reports this month (newest value per test)",
+                    value=True, variable=state["merge"]).pack(anchor="w", padx=12, pady=(2, 8))
 
     # --- Run button + log ---
     btn_run = ttk.Button(root, text="Run")
@@ -107,6 +117,8 @@ def run_gui():
                 "--browser", state["browser"].get(),
                 "--month", state["month"].get().strip() or date.today().strftime("%Y-%m"),
             ]
+            if state["merge"].get():
+                sys.argv.append("--merge-month")
             old_stdout = sys.stdout
             sys.stdout = _QueueWriter()
             try:

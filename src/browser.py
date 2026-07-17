@@ -445,6 +445,29 @@ def pick_target_row(rows: list[ResultRow], month_filter: str | None,
     return max(all_services, key=lambda r: r.visit_date)
 
 
+def pick_all_month_rows(rows: list[ResultRow], month_filter: str | None,
+                        allow_older: bool = False) -> list[ResultRow]:
+    """Return ALL 'All Services' rows within the given month ('YYYY-MM'),
+    oldest first. Used by merge mode, which combines every report in the
+    month keeping the newest value per test. If none match the month and
+    allow_older is set, returns all All Services rows instead."""
+    all_services = [r for r in rows if r.test_department == ALL_SERVICES_LABEL and r.visit_date]
+    if not all_services:
+        return []
+
+    if month_filter:
+        year, month = map(int, month_filter.split("-"))
+        in_month = [r for r in all_services
+                    if r.visit_date.year == year and r.visit_date.month == month]
+        if in_month:
+            return sorted(in_month, key=lambda r: r.visit_date)
+        if not allow_older:
+            return []
+
+    return sorted(all_services, key=lambda r: r.visit_date)
+
+
+
 def fetch_report_pdf(context: BrowserContext, page: Page, row: ResultRow) -> bytes:
     """Open the report for the given row and return the PDF bytes.
 
