@@ -42,20 +42,48 @@ STOP_MARKERS = ("Reviewed By:", "Verified By", "Printed By", "Page ", "All Right
 #   "Hemoglobin 10.6 L g/dl 12 - 15.5"
 #   "MCHC 31.5 g/dl 30 - 37"                (no H/L flag)
 #   "Alanine Aminotransferase (ALT) 11 U/L 5 - 31"
+#   "Ferritin In Serum 2,000 H ng/mL 13 - 150"   (comma thousands separator)
+#   "Troponin <0.01 ng/mL 0 - 0.04"              (< or > prefixed result)
+#
+# NOTE: the test-name group deliberately EXCLUDES digits. Previously it
+# allowed them, so a result the number pattern couldn't match (e.g. the
+# comma in "2,000") got swallowed into the test name and the parser then
+# grabbed the first number of the REFERENCE RANGE as the result. Keeping
+# digits out of the name means an unmatched result can no longer be hidden
+# inside it - the line simply won't match and lands in unparsed_lines where
+# it's visible instead of silently wrong.
 NUMERIC_ROW_RE = re.compile(
-    r"^(?P<test>[A-Za-z0-9()/,.\-\s]+?)\s+"
-    r"(?P<result>-?\d+\.?\d*)\s+"
+    r"^(?P<test>[A-Za-z()/,.\-\s]+?)\s+"
+    r"(?P<result>[<>]?\s*-?\d[\d,]*\.?\d*)\s+"
     r"(?:(?P<flag>[HL])\s+)?"
     r"(?P<unit>\S+)\s+"
     r"(?P<ref>.+)$"
 )
 
+# Same as above but for tests whose NAME legitimately contains a number,
+# e.g. "Vitamin B12", "Hepatitis B", "CD4 Count". Tried only if the strict
+# pattern above fails, and it requires a reference range to be present so a
+# result can't be confused with part of the name.
+NUMERIC_ROW_WITH_NUM_IN_NAME_RE = re.compile(
+    r"^(?P<test>[A-Za-z][A-Za-z0-9()/,.\-\s]*?)\s+"
+    r"(?P<result>[<>]?\s*-?\d[\d,]*\.?\d*)\s+"
+    r"(?:(?P<flag>[HL])\s+)?"
+    r"(?P<unit>\S+)\s+"
+    r"(?P<ref>[\d<>].*)$"
+)
+
 # A qualitative result row (no ref range, e.g. "Blood Group A Positive"),
-# kept as a fallback - less strict, only used if NUMERIC_ROW_RE fails.
+# kept as a fallback - less strict, only used if the numeric patterns fail.
 QUALITATIVE_ROW_RE = re.compile(
     r"^(?P<test>[A-Za-z0-9()/,.\-\s]+?)\s+"
     r"(?P<result>[A-Za-z][A-Za-z\s]*)$"
 )
+
+
+def _clean_number(text: str) -> str:
+    """Normalize a parsed result: strip spaces and thousands separators, so
+    '2,000' becomes '2000' and '< 0.01' becomes '<0.01'."""
+    return text.replace(",", "").replace(" ", "").strip()
 
 
 @dataclass
@@ -124,12 +152,12 @@ def _parse_rows(page_text: str) -> tuple[list[dict], list[str]]:
         if any(line.startswith(marker) for marker in STOP_MARKERS):
             break
 
-        m = NUMERIC_ROW_RE.match(line)
+        m = NUMERIC_ROW_RE.match(line) or NUMERIC_ROW_WITH_NUM_IN_NAME_RE.match(line)
         if m:
             rows.append({
                 "category": category,
                 "test": m.group("test").strip(),
-                "result": m.group("result").strip(),
+                "result": _clean_number(m.group("result")),
                 "flag": m.group("flag") or "",
                 "unit": m.group("unit").strip(),
                 "ref_range": m.group("ref").strip(),
