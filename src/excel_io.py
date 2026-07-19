@@ -130,7 +130,7 @@ def write_master_workbook(output_path: str, all_results: list[dict],
     _write_sheet(ws, RESULT_HEADERS, [
         [
             r.get("patient_id", ""), r.get("patient_name", ""),
-            r.get("test", ""), _result_with_flag(r),
+            r.get("test", ""), _numeric_result(r.get("result", "")),
             r.get("reported_on", ""),
         ]
         for r in all_results
@@ -172,10 +172,20 @@ def _write_sheet(ws, headers: list[str], rows: list[list]) -> None:
     ws.freeze_panes = "A2"
 
 
-def _result_with_flag(r: dict) -> str:
-    """Combine the numeric result with its H/L flag so that high/low info
-    isn't lost now that the separate Flag column has been removed.
-    e.g. result '10.6' + flag 'L' -> '10.6 L'."""
-    result = str(r.get("result", "") or "")
-    flag = str(r.get("flag", "") or "").strip()
-    return f"{result} {flag}".strip() if flag else result
+def _numeric_result(value) -> object:
+    """Return the result as a real number so Excel can sort/average/chart it.
+
+    Values that genuinely aren't plain numbers (e.g. '<0.01', '>1000',
+    'Positive') are left as text - forcing those into a number would
+    silently change their meaning."""
+    if value is None:
+        return ""
+    text = str(value).strip().replace(",", "")
+    if text == "":
+        return ""
+    try:
+        num = float(text)
+    except ValueError:
+        return text  # e.g. '<0.01', 'Positive' - keep exactly as reported
+    # Use int when there's no fractional part, so 106.0 shows as 106.
+    return int(num) if num.is_integer() and "." not in text else num
